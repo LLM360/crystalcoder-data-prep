@@ -32,7 +32,7 @@ git clone https://github.com/Cerebras/modelzoo.git
 
 We tokenize the [SlimPajama dataset](https://huggingface.co/datasets/cerebras/SlimPajama-627B) (in `jsonl` format) and [StarCoder dataset](https://huggingface.co/datasets/bigcode/starcoderdata) (in `parquet` format) to `hdf5` format. This is done using the [`create_hdf5_dataset.py`](https://github.com/Cerebras/modelzoo/blob/main/modelzoo/transformers/data_processing/scripts/hdf5_preprocessing/create_hdf5_dataset.py) script.
 
-### SlimPajama data
+### 1. SlimPajama data
 
 #### Tokenization
 
@@ -65,7 +65,7 @@ done
 ```
 
 
-### StarCoder data
+### 2. StarCoder data
 
 First, we convert the original `parquet` format to `jsonl` format.
 
