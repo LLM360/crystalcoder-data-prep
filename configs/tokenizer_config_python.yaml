@@ -1,0 +1,35 @@
+
+setup:
+    ## for training data
+    input_dir: "data/starcoderdata_jsonl_split/train/python" 
+    output_dir: "data/starcoderdata_tokenized_stage3_split/train/python" 
+    processes: 4 # 64
+
+    dataset_processor: "LMDataPreprocessor"
+
+processing:
+    tokenizer_type: "NeoXTokenizer"
+    encoder_file: "tokenizer.json" # replace with your directory
+    eos_id: 2
+    pad_id: 2
+
+    max_seq_length: 2048
+    short_seq_prob: 0.0
+
+    output_name: "examples"
+    files_per_record: 50000
+    write_in_batch: True
+
+    write_remainder: True
+    resume_from_checkpoint: False
+    display_pbar: True
+    seed: 45
+
+dataset:
+    use_ftfy: True
+    ftfy_normalizer: "NFC"
+    wikitext_detokenize: False
+    min_sequence_len: 10
+    sep_token: null
+    # prompt_key: "source"
+    # completion_key: "target"

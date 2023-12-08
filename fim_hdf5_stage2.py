@@ -1,32 +1,30 @@
 import os
 import glob
-import tqdm
+from tqdm.auto import tqdm
 import json
 import numpy as np
 import random
 from functools import partial
+from itertools import repeat
 from transformers import AutoTokenizer
+from transformers.utils import logging as hf_tx_logging
 from tokenizers import Tokenizer
-import multiprocessing
+from math import ceil
+from multiprocessing import Pool, RLock
 import copy
+import h5py
 
 import logging
 logging.basicConfig(level=logging.INFO)
+# ignore transformers warning for seq len > model seq len, for pbars to update inplace
+hf_tx_logging.set_verbosity_error()
 
-import h5py
 
-# ==================== Modify these ====================
-
-TOKENIZED_DATASETS_DIR = '/starcoderdata_tokenized/path'
-OUTPUT_DIR = '/starcoderdata_tokenized_fim'
+TOKENIZED_DATASETS_DIR = './data/starcoderdata_tokenized/'
+OUTPUT_DIR = './data/StarCoder_fim/epoch'
 SEED = 0
-NUM_PROCESSES = 8
-MULTIPROCESSING_CHUNKSIZE = 100
-NUM_SELECTED_FILES = None # set to None if using all files
-TOKENIZER_NAME = 'huggyllama/llama-7b'
-TOKENIZER_PATH = '/local/tokenizer/path'
+NUM_PROCESSES = 96
 
-# =======================================================
 
 FIM_RATE = 0.9
 NUM_EPOCHS = 2
@@ -36,8 +34,12 @@ for output_dir in OUTPUT_DIRS:
         os.makedirs(output_dir)
 
 
+
+TOKENIZER_NAME = 'huggyllama/llama-7b'
+TOKENIZER_PATH = './tokenizer.json'
 CONTEXT_LENGTH = 2048
 MULTIPROCESSING_BUFFERSIZE = 12800
+MULTIPROCESSING_CHUNKSIZE = 100
 
 ADDITIONAL_SPECIAL_TOKENS = [
     "<fim_prefix>",
@@ -71,6 +73,7 @@ suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (
     tokenizer_global.vocab[tok]
     for tok in ['<fim_suffix>', '<fim_prefix>', '<fim_middle>', '<fim_pad>']
 )
+eos_id = tokenizer_global.eos_token_id
 
 
 # From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
@@ -79,6 +82,11 @@ def permute(sample, tokenizer, fim_rate, spm_rate, truncate_or_pad):
     Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
     Maintain the same sample length (if transform creates a few extra tokens, drop them).
     """
+
+    # suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (
+    #     tokenizer.vocab[tok]
+    #     for tok in ['<fim_suffix>', '<fim_prefix>', '<fim_middle>', '<fim_pad>']
+    # )
 
 
     if np.random.binomial(1, fim_rate):  # sample bernoulli dist
@@ -145,24 +153,16 @@ def permute(sample, tokenizer, fim_rate, spm_rate, truncate_or_pad):
 
 
 def fim(sample_array, tokenizer, fim_rate, spm_rate):
+    # sample_array is (3, 2048). [0, :] is token id, [1, :] is loss mask, [2, :] is label
+    # sample_array[n, 2, -1] == sample_array[n+1, 0, 0]
     sample = sample_array[0, :]
     sample_len = sample.shape[0]
-
-    permute_fn = partial(
-        permute,
-        tokenizer=tokenizer,
-        fim_rate=fim_rate,
-        spm_rate=spm_rate,
-        truncate_or_pad=False)
 
     if fim_rate != 0:
         assert (fim_rate <= 1 and fim_rate >= 0), \
             "FIM rate must be a probability 0 <= rate <= 1"
 
-        eod = tokenizer.eos_token_id
-        pad = tokenizer.vocab['<fim_pad>']
-
-        segment_breaks = np.argwhere(sample == eod)  # split sample by document
+        segment_breaks = np.argwhere(sample == eos_id)  # split sample by document
 
         if segment_breaks.shape != (0, 1):
             # then there is an EOD token in this example
@@ -171,21 +171,36 @@ def fim(sample_array, tokenizer, fim_rate, spm_rate):
             for loc in np.nditer(segment_breaks):
                 # Only permute non-empty segments.
                 if loc - curr_start_position > 0:
-                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                    permuted = permute_fn(
-                        sample=sample[curr_start_position:loc])
-                    new_samples += [permuted, [eod]]
+                    permuted = permute(
+                        sample=sample[curr_start_position:loc],
+                        tokenizer=tokenizer,
+                        fim_rate=fim_rate,
+                        spm_rate=spm_rate,
+                        truncate_or_pad=False,
+                    )
+                    new_samples += [permuted, [eos_id]]
 
                 curr_start_position = loc + 1  # jump over the EOD token
-            # Permute the segment after the last EOD
-            permuted = permute_fn(sample=sample[curr_start_position:])
+            permuted = permute(
+                sample=sample[curr_start_position:],
+                tokenizer=tokenizer,
+                fim_rate=fim_rate,
+                spm_rate=spm_rate,
+                truncate_or_pad=False,
+            )
             new_samples.append(permuted)
 
             sample = np.concatenate(new_samples)
         else:
-            sample = permute_fn(sample=sample)
+            sample = permute(
+                sample=sample,
+                tokenizer=tokenizer,
+                fim_rate=fim_rate,
+                spm_rate=spm_rate,
+                truncate_or_pad=False,
+            )
 
-        new_labels = np.concatenate([sample[1:], [eod]])
+        new_labels = np.concatenate([sample[1:], [eos_id]])
 
         assert sample.shape[0] == new_labels.shape[0]
 
@@ -196,8 +211,8 @@ def fim(sample_array, tokenizer, fim_rate, spm_rate):
         sample = sample[:sample_len]
         new_labels = new_labels[:sample_len]
     elif diff < 0:  # too short
-        sample = np.concatenate([sample, np.full((-1 * diff), pad)])
-        new_labels = np.concatenate([new_labels, np.full((-1 * diff), pad)])
+        sample = np.concatenate([sample, np.full((-1 * diff), pad_tok_id)])
+        new_labels = np.concatenate([new_labels, np.full((-1 * diff), pad_tok_id)])
         new_masks[diff:] = 0
     try:
         assert sample.shape[0] == sample_len
@@ -222,53 +237,87 @@ def process_example(example, tokenizer, fim_rate, spm_rate):
     return examples
 
 
-def process_file(file, process_fn):
+def process_file(file, rank, tokenizer, fim_rate, spm_rate):
     try:
-        file, rng = file
-        np.random.seed(SEED + rng)
-        random.seed(SEED + rng)
+        # file, rng = file
+        np.random.seed(SEED + rank)
+        random.seed(SEED + rank)
         output_files = [output_dir + '/' + file.split('/')[-1] for output_dir in OUTPUT_DIRS]
-        data_array = np.array(h5py.File(file, 'r')['data'])
+        with h5py.File(file, 'r') as in_h5:
+            data_array = np.array(in_h5['data'])
+            n_examples = in_h5.attrs["n_examples"]
+            msl = data_array.shape[-1]
         data_fim_arrays = [[] for _ in range(NUM_EPOCHS)]
-        for j, line in enumerate(data_array):
-            if j % 1000 == 0:
-                logging.info('finished processing {} lines for file {}'.format(j, file))
-            line_fim_epochs = process_fn(line)
-            assert len(line_fim_epochs) == NUM_EPOCHS
-            for i in range(NUM_EPOCHS):
-                data_fim_arrays[i].append(line_fim_epochs[i])
+        logging.debug(f"Started processing samples in {file}.")
+        with tqdm(desc=f"File {file} progress", position=((rank+1)*2), total=n_examples, leave=False) as pbar:
+            for j, line in enumerate(data_array):
+                if j % 1000 == 0:
+                    pbar.update(1000)
+                    logging.debug('finished processing {} lines for file {}'.format(j, file))
+                line_fim_epochs = process_example(line, tokenizer, fim_rate, spm_rate)
+                assert len(line_fim_epochs) == NUM_EPOCHS
+                for i in range(NUM_EPOCHS):
+                    data_fim_arrays[i].append(line_fim_epochs[i])
+            pbar.update(n_examples - (j * 1000))
+            logging.debug(f"Finished processing: {file}. Writing to HDF5.")
         for i in range(NUM_EPOCHS):
             data_fim_arrays[i] = np.stack(data_fim_arrays[i], axis=0)
         for i, output_file in enumerate(output_files):
             with h5py.File(output_file, 'w') as f:
-                f.create_dataset('data', data=data_fim_arrays[i], dtype='i4', compression='gzip')
+                f.attrs["n_examples"] = n_examples
+                f.create_dataset(
+                    'data', 
+                    data=data_fim_arrays[i],
+                    dtype="i4",
+                    chunks=(1, 3, msl),
+                    compression="gzip",
+                )
+            logging.debug(f"Done writing output file: {output_file}.")
     except Exception as e:
         logging.info("error in processing ", file)
         logging.info(e)
 
 
+def process_files(process_args):
+    files, rank, tokenizer, fim_rate, spm_rate = process_args
+    for file in tqdm(files, desc=f"Processed files in process {rank}", position=((rank+1)*2)-1, leave=False):
+        process_file(file, rank, tokenizer, fim_rate, spm_rate)
 
 
 def main(spm_rate=0.):
-    process_fn = partial(
-        process_example,
-        tokenizer=tokenizer_global,
-        fim_rate=FIM_RATE,
-        spm_rate=spm_rate)
 
-    process_file_fn = partial(process_file, process_fn=process_fn)
-
-    # ============== parallel ================
+    # ============== parallel split files per process ================
     logging.info('start parallel processing')
-    pool = multiprocessing.Pool(processes=NUM_PROCESSES)
-    files = glob.glob(str(TOKENIZED_DATASETS_DIR)+'/*.h5')
-    if NUM_SELECTED_FILES is not None:
-        files = files[:NUM_SELECTED_FILES]
-    files_sublists = [files[i:i+NUM_PROCESSES] for i in range(0, len(files), NUM_PROCESSES)]
-    for files_sublist in files_sublists:
-        pool.map(process_file_fn, zip(files_sublist, range(len(files))))
-    # ========================================
-        
+    dataset_files = glob.glob(str(TOKENIZED_DATASETS_DIR)+'/*.h5')
+
+    n_chunks = ceil(len(dataset_files) / NUM_PROCESSES)
+    files_per_process = [
+        dataset_files[i : i + n_chunks] for i in range(0, len(dataset_files), n_chunks)
+    ]
+
+    # add assertion to check if the split files per process is equal to 
+    # total files ensuding there's no duplication
+    assert len(dataset_files) == sum(map(lambda l: len(l), files_per_process))
+    # https://github.com/tqdm/tqdm/blob/master/examples/parallel_bars.py#L46
+    tqdm.set_lock(RLock())
+    with Pool(initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),), processes=NUM_PROCESSES) as pool:
+        pbar = tqdm(
+                pool.imap(
+                    process_files, 
+                    zip(
+                        files_per_process, 
+                        range(len(files_per_process)),
+                        repeat(tokenizer_global), 
+                        repeat(FIM_RATE),
+                        repeat(spm_rate),
+                    )
+                ),
+                desc="Total progress",
+                total=len(files_per_process),
+            )
+        for _ in pbar:
+            pbar.update()
+
 
 if __name__ == '__main__':
     main(0.5)
