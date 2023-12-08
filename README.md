@@ -34,7 +34,11 @@ We tokenize the [SlimPajama dataset](https://huggingface.co/datasets/cerebras/Sl
 
 ### SlimPajama data
 
+#### Tokenization
+
 #### Data split
+
+The script below is employed to divide the SlimPajama data into two equal portions based on the even or odd nature of their file numbers. The subset with even-numbered files is utilized for Stage 1, while the odd-numbered subset is designated for Stage 2.
 
 ```
 for i in `ls | grep train_packed | grep -v "_part[01]of2"`
@@ -69,6 +73,8 @@ First, we convert the original `parquet` format to `jsonl` format.
 python parquet2jsonl.py
 ```
 
+Next, we proceed to tokenize the data related to StarCoder for Stage 2 and Stage 3, respectively.
+
 #### Stage 2
 
 We tokenize the `jsonl` files from all programming languages together:
@@ -87,7 +93,7 @@ python -B modelzoo/transformers/data_processing/scripts/hdf5_preprocessing/creat
 
 Here we tokenize the subfolders: `Python`, `HTML`, `JaveScript`, `CSS` independently using similar scripts.
 ```
-bash scripts/script.sh
+bash scripts/stage3_tokenization_script.sh
 ```
 
 
@@ -103,7 +109,7 @@ python fim_hdf5_stage2.py
 
 #### Stage 3
 ```
-python fim_hdf5_stage2.py
+python fim_hdf5_stage3.py
 ```
 
 ## Step 3: Shuffling
